@@ -12,26 +12,42 @@
 #                   ※ maxReceiveCount 超過による DLQ への自動移動は
 #                     DLQ の NumberOfMessagesSent に計上されない(AWS仕様)ため
 #
+#    SQS の API は使用せず、CloudWatch のメトリクスのみを参照する。
+#    DLQ を省略した場合は CloudWatch のメトリクス一覧から命名規則(<キュー名>-dlq 等)で検出する。
+#
 #  動作環境:
 #    RHEL 9 系 (bash 5.1 / GNU coreutils / python3 3.9 ※標準ライブラリのみ使用)
 #    AWS CLI v2 (v1 でも動作可)
 #
-#  必要な IAM 権限:
-#    sqs:GetQueueUrl, sqs:GetQueueAttributes, cloudwatch:GetMetricData
+#  必要な IAM 権限 (SQS の権限は不要):
+#    cloudwatch:GetMetricData  必須
+#    cloudwatch:ListMetrics    DLQ の自動検出・キューの存在確認に使用 (無い場合は -d で DLQ を指定)
+#    ※ 認証情報の表示に sts:GetCallerIdentity を使用する (IAM 権限は不要)
+#
+#  スイッチバック:
+#    本スクリプトは CodeCommit の操作を必要としない。現在の認証情報(CodeCommit 用に
+#    スイッチロールした状態など)で CloudWatch を参照できない場合は、スイッチバックを
+#    促すメッセージを表示して終了する(-b warn) か、スイッチバック用シェルを source して
+#    スイッチバックしてから処理を継続する(-b auto)。
 #
 #  使い方は -h を参照。
 #==============================================================================
 set -euo pipefail
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.0.0"
+readonly SCRIPT_VERSION="2.0.0"
 readonly DETAIL_LOOKBACK_SEC=3600                 # 期間開始直前の基準値算出用に詳細データを先読みする秒数
 readonly BASELINE_LOOKBACK_SEC=$((14 * 86400))    # 基準値を探索する範囲(SQS の最大メッセージ保持期間)
+readonly LATEST_LOOKBACK_SEC=$((3 * 3600))        # 直近のメッセージ数を探索する範囲
 readonly MAX_DETAIL_ROWS=1000000                  # 詳細シートの最大行数(Excel の行数上限対策)
 
 # 実行コマンド(環境変数で差し替え可能)
 AWS_BIN="${AWS_BIN:-aws}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
+
+# スイッチバック(環境変数で既定値を指定可能。オプション指定が優先)
+SWITCHBACK_MODE="${SWITCHBACK_MODE:-warn}"        # 権限不足時の動作 warn / auto
+SWITCHBACK_SCRIPT="${SWITCHBACK_SCRIPT:-}"        # スイッチバック用シェル(source で読み込む)
 
 # 引数
 QUEUE_INPUT=""
@@ -58,6 +74,11 @@ MAIN_URL=""
 DLQ_NAME=""
 DLQ_URL=""
 DLQ_SOURCE=""
+QUEUE_ACCOUNT=""      # キュー URL のアカウント ID
+CALLER_ACCOUNT=""     # 認証情報のアカウント ID
+CALLER_ARN=""         # 認証情報の ARN
+ACCESS_PROBLEM=""     # 現在の認証情報で処理を実行できない理由
+SWITCHED_BACK=0
 NOTES=()
 
 #------------------------------------------------------------------------------
@@ -70,6 +91,7 @@ usage() {
 
   指定した SQS キューと DLQ の CloudWatch メトリクスから、時間単位のメッセージ
   追加状況を集計した Excel レポート(.xlsx)を出力します。
+  SQS の API は使用せず、CloudWatch のメトリクスのみを参照します。
 
 必須:
   -q, --queue <名前|URL>      対象の SQS キュー名またはキュー URL
@@ -80,7 +102,13 @@ usage() {
                               ※ 開始は時単位で切り捨て、終了は時単位で切り上げます
                               ※ 指定例: "2026-10-01 09:00" / "2026/10/01 09:00" /
                                         202610010900 / "yesterday 00:00" / "3 days ago"
-  -d, --dlq <名前|URL|none>   DLQ (省略時は RedrivePolicy から自動検出、none で DLQ 集計なし)
+  -d, --dlq <名前|URL|none>   DLQ (none で DLQ 集計なし)
+                              省略時は CloudWatch のメトリクス一覧から命名規則で自動検出
+                              (<キュー名>-dlq / <キュー名>_DLQ / <キュー名>-deadletter /
+                               dlq-<キュー名> 等。xxx-queue の場合は xxx-dlq も対象)
+                              ※ RedrivePolicy とは照合しません。また、直近2週間に
+                                メトリクスが無い DLQ は検出できないため、確実に集計する
+                                場合は DLQ を指定してください
   -z, --timezone <TZ>         日時の解釈・表示に使うタイムゾーン (既定: Asia/Tokyo)
   -g, --granularity <秒>      詳細データの粒度 auto|60|300|3600 (既定: auto)
                               auto: CloudWatch の保持期間に応じて 60秒(15日以内) →
@@ -90,12 +118,31 @@ usage() {
   -o, --output <パス>         出力ファイル
                               (既定: ./sqs_report_<キュー名>_<開始>-<終了>.xlsx)
   -k, --keep-raw              取得した生データ(JSON)を <出力ファイル名>_raw/ に保存
+  -b, --switchback <warn|auto>
+                              現在の認証情報で CloudWatch を参照できない場合の動作
+                              (既定: warn / 環境変数 SWITCHBACK_MODE でも指定可)
+                              warn: スイッチバックを促すメッセージを表示して終了
+                              auto: スイッチバック用シェルを source してスイッチバックし、
+                                    処理を継続
+                              ※ CodeCommit 用にスイッチロールした状態などで、権限不足・
+                                認証情報の期限切れ・キュー URL とアカウントが異なる場合に
+                                スイッチバックします
+                              ※ auto のスイッチバックは本スクリプトの実行中のみ有効です
+                                (呼び出し元のシェルの認証情報は変わりません)
+  -B, --switchback-script <パス>
+                              スイッチバック用シェルのパス (auto の場合は必須)
+                              (環境変数 SWITCHBACK_SCRIPT でも指定可)
   -h, --help                  このヘルプを表示
+
+必要な IAM 権限 (SQS の権限は不要):
+  cloudwatch:GetMetricData    必須
+  cloudwatch:ListMetrics      DLQ の自動検出・キューの存在確認に使用 (無い場合は -d で DLQ を指定)
 
 例:
   ${SCRIPT_NAME} -q my-queue -s "2026-10-16 00:00" -e "2026-10-17 00:00"
   ${SCRIPT_NAME} -q my-queue -s "3 days ago" -o /var/tmp/my-queue.xlsx
   ${SCRIPT_NAME} -q https://sqs.ap-northeast-1.amazonaws.com/123456789012/my-queue -d my-dlq
+  ${SCRIPT_NAME} -q my-queue -b auto -B /path/to/switchback.sh
 
 出力シート:
   サマリー / 時間別レポート / グラフ / 時間別_メインキュー / 時間別_DLQ /
@@ -103,6 +150,7 @@ usage() {
 
 終了コード:
   0: 正常終了  1: 引数エラー  2: 実行環境エラー  3: AWS API エラー  4: レポート生成エラー
+  5: AWS の権限エラー (スイッチバックが必要 / スイッチバック後も実行不可)
 EOF
 }
 
@@ -147,13 +195,24 @@ aws_cmd() {
   AWS_PAGER="" "${AWS_BIN}" "${opts[@]}" "$@"
 }
 
+# 直前の AWS CLI のエラーメッセージ(1行にまとめる)
+aws_error() {
+  tr -s '\r\n' '  ' <"${WORK_DIR}/aws_err.log"
+}
+
+# 直前の AWS CLI のエラーが認証情報・権限の問題によるものか
+is_auth_error() {
+  grep -Eqi 'AccessDenied|UnauthorizedOperation|not authorized|ExpiredToken|InvalidClientTokenId|UnrecognizedClient|SignatureDoesNotMatch|InvalidSignature|Unable to locate credentials|security token included in the request is (invalid|expired)|Token has expired' \
+    "${WORK_DIR}/aws_err.log"
+}
+
 # AWS CLI を実行し、標準出力をファイルに保存する。失敗時は終了する。
 #   $1: 処理名  $2: 出力ファイル  $3以降: aws の引数
 aws_to_file() {
   local desc="$1" out="$2"
   shift 2
   if ! aws_cmd "$@" >"${out}" 2>"${WORK_DIR}/aws_err.log"; then
-    die 3 "${desc}に失敗しました: $(tr -s '\r\n' '  ' <"${WORK_DIR}/aws_err.log")"
+    die 3 "${desc}に失敗しました: $(aws_error)"
   fi
 }
 
@@ -206,18 +265,20 @@ parse_args() {
       set -- "${1%%=*}" "${1#*=}" "${@:2}"
     fi
     case "$1" in
-      -q | --queue)       need_arg "$1" "${2:-}"; QUEUE_INPUT="$2"; shift 2 ;;
-      -d | --dlq)         need_arg "$1" "${2:-}"; DLQ_INPUT="$2"; shift 2 ;;
-      -s | --start)       need_arg "$1" "${2:-}"; START_INPUT="$2"; shift 2 ;;
-      -e | --end)         need_arg "$1" "${2:-}"; END_INPUT="$2"; shift 2 ;;
-      -z | --timezone)    need_arg "$1" "${2:-}"; TZ_NAME="$2"; shift 2 ;;
-      -g | --granularity) need_arg "$1" "${2:-}"; GRANULARITY="$2"; shift 2 ;;
-      -r | --region)      need_arg "$1" "${2:-}"; REGION="$2"; shift 2 ;;
-      -p | --profile)     need_arg "$1" "${2:-}"; PROFILE="$2"; shift 2 ;;
-      -o | --output)      need_arg "$1" "${2:-}"; OUTPUT="$2"; shift 2 ;;
-      -k | --keep-raw)    KEEP_RAW=1; shift ;;
-      -h | --help)        usage; exit 0 ;;
-      *)                  usage >&2; die 1 "不明な引数です: $1" ;;
+      -q | --queue)             need_arg "$1" "${2:-}"; QUEUE_INPUT="$2"; shift 2 ;;
+      -d | --dlq)               need_arg "$1" "${2:-}"; DLQ_INPUT="$2"; shift 2 ;;
+      -s | --start)             need_arg "$1" "${2:-}"; START_INPUT="$2"; shift 2 ;;
+      -e | --end)               need_arg "$1" "${2:-}"; END_INPUT="$2"; shift 2 ;;
+      -z | --timezone)          need_arg "$1" "${2:-}"; TZ_NAME="$2"; shift 2 ;;
+      -g | --granularity)       need_arg "$1" "${2:-}"; GRANULARITY="$2"; shift 2 ;;
+      -r | --region)            need_arg "$1" "${2:-}"; REGION="$2"; shift 2 ;;
+      -p | --profile)           need_arg "$1" "${2:-}"; PROFILE="$2"; shift 2 ;;
+      -o | --output)            need_arg "$1" "${2:-}"; OUTPUT="$2"; shift 2 ;;
+      -k | --keep-raw)          KEEP_RAW=1; shift ;;
+      -b | --switchback)        need_arg "$1" "${2:-}"; SWITCHBACK_MODE="$2"; shift 2 ;;
+      -B | --switchback-script) need_arg "$1" "${2:-}"; SWITCHBACK_SCRIPT="$2"; shift 2 ;;
+      -h | --help)              usage; exit 0 ;;
+      *)                        usage >&2; die 1 "不明な引数です: $1" ;;
     esac
   done
 
@@ -228,6 +289,10 @@ parse_args() {
   case "${GRANULARITY}" in
     auto | 60 | 300 | 3600) ;;
     *) die 1 "粒度(-g)は auto / 60 / 300 / 3600 のいずれかを指定してください: ${GRANULARITY}" ;;
+  esac
+  case "${SWITCHBACK_MODE}" in
+    warn | auto) ;;
+    *) die 1 "権限不足時の動作(-b)は warn / auto のいずれかを指定してください: ${SWITCHBACK_MODE}" ;;
   esac
 }
 
@@ -242,6 +307,16 @@ check_prereqs() {
     die 2 "GNU date が必要です"
   if [[ "${TZ_NAME}" != "UTC" && -d /usr/share/zoneinfo && ! -f "/usr/share/zoneinfo/${TZ_NAME}" ]]; then
     die 1 "不明なタイムゾーンです: ${TZ_NAME} (例: Asia/Tokyo, UTC)"
+  fi
+  if [[ -n "${SWITCHBACK_SCRIPT}" && "${SWITCHBACK_SCRIPT}" != */* ]]; then
+    # source はスラッシュを含まないファイル名を PATH から探すため、カレントディレクトリを明示する
+    SWITCHBACK_SCRIPT="./${SWITCHBACK_SCRIPT}"
+  fi
+  if [[ "${SWITCHBACK_MODE}" == "auto" ]]; then
+    [[ -n "${SWITCHBACK_SCRIPT}" ]] ||
+      die 1 "-b auto の場合はスイッチバック用シェルを -B または環境変数 SWITCHBACK_SCRIPT で指定してください"
+    [[ -f "${SWITCHBACK_SCRIPT}" && -r "${SWITCHBACK_SCRIPT}" ]] ||
+      die 1 "スイッチバック用シェルが存在しないか読み取りできません: ${SWITCHBACK_SCRIPT}"
   fi
 }
 
@@ -321,42 +396,32 @@ region_from_url() {
   fi
 }
 
-resolve_queues() {
-  local arn_region
+account_from_url() {
+  if [[ "$1" =~ ^https?://[^/]+/([0-9]{12})/ ]]; then
+    echo "${BASH_REMATCH[1]}"
+  fi
+}
 
-  # メインキュー
+valid_queue_name() {
+  [[ "$1" =~ ^[A-Za-z0-9_-]{1,80}$ || "$1" =~ ^[A-Za-z0-9_-]{1,75}\.fifo$ ]]
+}
+
+# キュー名・URL を解析する (AWS の API は呼び出さない)
+parse_queue_inputs() {
   if [[ "${QUEUE_INPUT}" =~ ^https?:// ]]; then
     MAIN_URL="${QUEUE_INPUT%/}"
     MAIN_NAME="${MAIN_URL##*/}"
+    QUEUE_ACCOUNT="$(account_from_url "${MAIN_URL}")"
     if [[ -z "${REGION}" ]]; then
       REGION="$(region_from_url "${MAIN_URL}")"
     fi
   else
     MAIN_NAME="${QUEUE_INPUT}"
-    aws_to_file "キュー URL の取得(${MAIN_NAME})" "${WORK_DIR}/main_url.txt" \
-      sqs get-queue-url --queue-name "${MAIN_NAME}" --query QueueUrl --output text
-    MAIN_URL="$(tr -d '\r\n' <"${WORK_DIR}/main_url.txt")"
   fi
-  log INFO "メインキュー: ${MAIN_NAME} (${MAIN_URL})"
-  aws_to_file "キュー属性の取得(${MAIN_NAME})" "${WORK_DIR}/main_attrs.json" \
-    sqs get-queue-attributes --queue-url "${MAIN_URL}" --attribute-names All --output json
+  valid_queue_name "${MAIN_NAME}" || die 1 "キュー名が不正です: ${MAIN_NAME}"
 
-  # CloudWatch はキューと同じリージョンで参照する
-  if [[ -z "${REGION}" ]]; then
-    arn_region="$(run_py attr --attrs "${WORK_DIR}/main_attrs.json" --name QueueArn | cut -d: -f4)"
-    REGION="${arn_region}"
-  fi
-
-  # DLQ
   case "${DLQ_INPUT}" in
     "")
-      DLQ_NAME="$(run_py dlq-name --attrs "${WORK_DIR}/main_attrs.json")"
-      if [[ -n "${DLQ_NAME}" ]]; then
-        DLQ_SOURCE="auto"
-      else
-        DLQ_SOURCE="notfound"
-        warn "メインキューに RedrivePolicy(DLQ) が設定されていないため、DLQ の集計は行いません"
-      fi
       ;;
     none | NONE | None)
       DLQ_SOURCE="none"
@@ -371,24 +436,197 @@ resolve_queues() {
       DLQ_SOURCE="arg"
       ;;
   esac
+  if [[ -n "${DLQ_NAME}" ]] && ! valid_queue_name "${DLQ_NAME}"; then
+    die 1 "DLQ 名が不正です: ${DLQ_NAME}"
+  fi
+}
 
-  if [[ -n "${DLQ_NAME}" ]]; then
-    if [[ -z "${DLQ_URL}" ]]; then
-      if aws_cmd sqs get-queue-url --queue-name "${DLQ_NAME}" --query QueueUrl --output text \
-        >"${WORK_DIR}/dlq_url.txt" 2>"${WORK_DIR}/aws_err.log"; then
-        DLQ_URL="$(tr -d '\r\n' <"${WORK_DIR}/dlq_url.txt")"
+# 現在の認証情報で処理を実行できるか(CloudWatch のメトリクスを参照できるか)を確認する。
+# 実行できない場合は ACCESS_PROBLEM に理由を設定して 1 を返す。
+# 認証情報・権限以外のエラー(リージョン未設定・通信エラー等)の場合は終了する。
+check_access() {
+  ACCESS_PROBLEM=""
+  CALLER_ACCOUNT=""
+  CALLER_ARN=""
+  # 認証情報の表示用 (sts:GetCallerIdentity は IAM 権限不要)。失敗しても確認は継続する
+  if aws_cmd sts get-caller-identity --query '[Account,Arn]' --output text \
+    >"${WORK_DIR}/identity.txt" 2>/dev/null; then
+    read -r CALLER_ACCOUNT CALLER_ARN <"${WORK_DIR}/identity.txt" || true
+    CALLER_ARN="${CALLER_ARN%$'\r'}"
+  fi
+  if ! aws_cmd cloudwatch get-metric-data \
+    --metric-data-queries "file://${WORK_DIR}/queries_probe.json" \
+    --start-time "$(iso_utc $((NOW_EPOCH - 3600)))" \
+    --end-time "$(iso_utc "${NOW_EPOCH}")" \
+    --output json >/dev/null 2>"${WORK_DIR}/aws_err.log"; then
+    is_auth_error || die 3 "CloudWatch へのアクセス確認に失敗しました: $(aws_error)"
+    ACCESS_PROBLEM="CloudWatch のメトリクスを参照できません(cloudwatch:GetMetricData): $(aws_error)"
+  elif [[ -n "${QUEUE_ACCOUNT}" && -n "${CALLER_ACCOUNT}" && "${QUEUE_ACCOUNT}" != "${CALLER_ACCOUNT}" ]]; then
+    # CloudWatch のメトリクスは認証情報のアカウントから取得されるため、別アカウントのキューは集計できない
+    ACCESS_PROBLEM="認証情報のアカウント(${CALLER_ACCOUNT})がキュー URL のアカウント(${QUEUE_ACCOUNT})と異なります"
+  fi
+  [[ -z "${ACCESS_PROBLEM}" ]]
+}
+
+# スイッチバック後の環境変数を取り込んでよいか
+# (シェルが管理する変数・読み取り専用の変数・本スクリプト内部の変数は除く)
+importable_var() {
+  local decl flags
+  [[ "$1" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
+  case "$1" in
+    _ | PWD | OLDPWD | SHLVL | SHELLOPTS | BASHOPTS) return 1 ;;
+  esac
+  decl="$(declare -p "$1" 2>/dev/null)" || return 0    # 未定義の変数
+  flags="${decl#declare -}"
+  flags="${flags%% *}"
+  [[ "${flags}" == *x* && "${flags}" != *r* ]]         # export 済み(=環境変数)で書き換え可能なもののみ
+}
+
+# スイッチバック用シェルを source で読み込み、変更された環境変数を本スクリプトに反映する。
+# スイッチバック用シェル内の exit・関数や変数の定義・シェルオプション・カレントディレクトリの
+# 変更が本スクリプトに影響しないよう、サブシェル内で source し、環境変数の差分のみを取り込む。
+run_switchback() {
+  local before="${WORK_DIR}/env_before" after="${WORK_DIR}/env_after" kv name rc=0
+  local -A old=() new=()
+  local -a changed=()
+
+  env -0 >"${before}"
+  (
+    set +euo pipefail
+    # shellcheck disable=SC1090
+    source "${SWITCHBACK_SCRIPT}" >&2
+    rc=$?
+    env -0 >"${after}"
+    exit "${rc}"
+  ) || rc=$?
+  if [[ ! -f "${after}" ]]; then
+    die 5 "スイッチバック用シェルが途中で終了しました(exit の実行、または set -e によるエラー終了): ${SWITCHBACK_SCRIPT}"
+  fi
+  if ((rc != 0)); then
+    log WARN "スイッチバック用シェルの終了コードが ${rc} でした"
+  fi
+
+  while IFS= read -r -d '' kv; do
+    name="${kv%%=*}"
+    if importable_var "${name}"; then
+      old["${name}"]="${kv#*=}"
+    fi
+  done <"${before}"
+  while IFS= read -r -d '' kv; do
+    name="${kv%%=*}"
+    if importable_var "${name}"; then
+      new["${name}"]="${kv#*=}"
+    fi
+  done <"${after}"
+  for name in "${!new[@]}"; do
+    if [[ ! -v "old[${name}]" || "${old[${name}]}" != "${new[${name}]}" ]]; then
+      export "${name}=${new[${name}]}"
+      changed+=("${name}")
+    fi
+  done
+  for name in "${!old[@]}"; do
+    if [[ ! -v "new[${name}]" ]]; then
+      unset "${name}"
+      changed+=("${name}(削除)")
+    fi
+  done
+  log INFO "スイッチバックで変更された環境変数: ${changed[*]:-なし}"
+}
+
+# AWS の操作権限を確認し、現在の認証情報で処理を実行できない場合はスイッチバックする。
+#   warn: スイッチバックを促すメッセージを表示して終了する
+#   auto: スイッチバック用シェルを source してスイッチバックし、処理を継続する
+ensure_aws_access() {
+  local cmd
+
+  run_py queries --kind probe --period 300 --main "${MAIN_NAME}" \
+    >"${WORK_DIR}/queries_probe.json" || die 4 "メトリクス取得クエリの生成に失敗しました"
+  log INFO "AWS の操作権限を確認しています..."
+  if check_access; then
+    log INFO "認証情報: ${CALLER_ARN:-不明}"
+    return
+  fi
+
+  if [[ "${SWITCHBACK_MODE}" == "warn" ]]; then
+    cmd="source <スイッチバック用シェル>"
+    if [[ -n "${SWITCHBACK_SCRIPT}" ]]; then
+      cmd="source $(printf '%q' "${SWITCHBACK_SCRIPT}")"
+    fi
+    log WARN "現在の認証情報では処理を実行できません"
+    log WARN "  認証情報: ${CALLER_ARN:-不明}"
+    log WARN "  理由    : ${ACCESS_PROBLEM}"
+    log WARN "本スクリプトは CodeCommit の操作を必要とせず、CloudWatch の参照権限が必要です。"
+    log WARN "スイッチバックしてから再実行してください:"
+    log WARN "  ${cmd}"
+    log WARN "※ -b auto を指定すると、スイッチバックを自動で実行して処理を継続します"
+    exit 5
+  fi
+
+  log WARN "現在の認証情報では処理を実行できないため、スイッチバックします"
+  log WARN "  認証情報: ${CALLER_ARN:-不明}"
+  log WARN "  理由    : ${ACCESS_PROBLEM}"
+  log INFO "スイッチバック用シェルを読み込みます: source ${SWITCHBACK_SCRIPT}"
+  run_switchback
+  if ! check_access; then
+    die 5 "スイッチバック後も処理を実行できません (認証情報: ${CALLER_ARN:-不明}): ${ACCESS_PROBLEM}${PROFILE:+ ※ -p 指定時は環境変数の認証情報より --profile が優先されます}"
+  fi
+  SWITCHED_BACK=1
+  log INFO "スイッチバックしました。認証情報: ${CALLER_ARN:-不明}"
+  log INFO "※ スイッチバックは本スクリプトの実行中のみ有効です(呼び出し元のシェルの認証情報は変わりません)"
+}
+
+# リージョンを決定する (-r / キュー URL で決まらない場合は AWS CLI の設定値)
+# ※ スイッチバックで AWS_REGION 等が変わる場合があるため、権限確認の後に行う
+resolve_region() {
+  if [[ -z "${REGION}" ]]; then
+    REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-}}"
+  fi
+  if [[ -z "${REGION}" ]]; then
+    REGION="$(aws_cmd configure get region 2>/dev/null | tr -d '\r\n')" || REGION=""
+  fi
+}
+
+# CloudWatch のメトリクス一覧からキューの存在を確認し、DLQ を決定する
+resolve_queues() {
+  local names="${WORK_DIR}/queue_names.txt" listed=0
+  local -a candidates=()
+
+  log INFO "メインキュー: ${MAIN_NAME}${MAIN_URL:+ (${MAIN_URL})}"
+  # 直近2週間にメトリクスがあるキューの一覧 (cloudwatch:ListMetrics)
+  if aws_cmd cloudwatch list-metrics --namespace AWS/SQS --metric-name ApproximateNumberOfMessagesVisible \
+    --output json >"${WORK_DIR}/list_metrics.json" 2>"${WORK_DIR}/aws_err.log"; then
+    run_py queue-names --list "${WORK_DIR}/list_metrics.json" | tr -d '\r' >"${names}" ||
+      die 4 "CloudWatch のメトリクス一覧の解析に失敗しました"
+    listed=1
+    if ! grep -Fxq -- "${MAIN_NAME}" "${names}"; then
+      warn "メインキュー(${MAIN_NAME})のメトリクスが直近2週間にありません(キュー名・リージョン・アカウントの誤り、または2週間以上非アクティブ)"
+    fi
+  else
+    log WARN "CloudWatch のメトリクス一覧を取得できませんでした(cloudwatch:ListMetrics): $(aws_error)"
+  fi
+
+  if [[ -z "${DLQ_INPUT}" ]]; then
+    if ((listed)); then
+      mapfile -t candidates < <(run_py dlq-candidates --names "${names}" --main "${MAIN_NAME}" | tr -d '\r')
+    fi
+    if ((${#candidates[@]} == 1)); then
+      DLQ_NAME="${candidates[0]}"
+      DLQ_SOURCE="auto"
+    else
+      DLQ_SOURCE="notfound"
+      if ((!listed)); then
+        warn "CloudWatch のメトリクス一覧を取得できないため DLQ を自動検出できません。DLQ がある場合は -d で指定してください"
+      elif ((${#candidates[@]} == 0)); then
+        warn "命名規則(<キュー名>-dlq 等)に一致する DLQ が見つからないため、DLQ の集計は行いません。DLQ がある場合は -d で指定してください(直近2週間にメトリクスが無い DLQ は自動検出できません)"
       else
-        warn "DLQ の URL を取得できませんでした(${DLQ_NAME})。メトリクスのみで集計します: $(tr -s '\r\n' '  ' <"${WORK_DIR}/aws_err.log")"
+        warn "DLQ の候補が複数あるため、DLQ の集計は行いません。-d で指定してください(候補: ${candidates[*]})"
       fi
     fi
-    if [[ -n "${DLQ_URL}" ]]; then
-      if ! aws_cmd sqs get-queue-attributes --queue-url "${DLQ_URL}" --attribute-names All --output json \
-        >"${WORK_DIR}/dlq_attrs.json" 2>"${WORK_DIR}/aws_err.log"; then
-        rm -f "${WORK_DIR}/dlq_attrs.json"
-        warn "DLQ の属性を取得できませんでした(${DLQ_NAME}): $(tr -s '\r\n' '  ' <"${WORK_DIR}/aws_err.log")"
-      fi
-    fi
-    log INFO "DLQ: ${DLQ_NAME} (${DLQ_URL:-URL不明}) [$([[ "${DLQ_SOURCE}" == "auto" ]] && echo 'RedrivePolicyから自動検出' || echo '引数指定')]"
+  elif [[ -n "${DLQ_NAME}" ]] && ((listed)) && ! grep -Fxq -- "${DLQ_NAME}" "${names}"; then
+    log INFO "DLQ(${DLQ_NAME})のメトリクスは直近2週間にありません(DLQ が空で非アクティブな場合も該当します)"
+  fi
+  if [[ -n "${DLQ_NAME}" ]]; then
+    log INFO "DLQ: ${DLQ_NAME}${DLQ_URL:+ (${DLQ_URL})} [$([[ "${DLQ_SOURCE}" == "auto" ]] && echo '命名規則から自動検出' || echo '引数指定')]"
   fi
 }
 
@@ -421,6 +659,17 @@ fetch_metrics() {
     --start-time "$(iso_utc $((START_EPOCH - BASELINE_LOOKBACK_SEC)))" \
     --end-time "$(iso_utc "${START_EPOCH}")" \
     --scan-by TimestampAscending --output json
+
+  # レポート作成時点の滞留状況(直近のメッセージ数・1分粒度)
+  run_py queries --kind latest --period 60 --main "${MAIN_NAME}" "${dlq_opt[@]}" \
+    >"${WORK_DIR}/queries_latest.json" || die 4 "メトリクス取得クエリの生成に失敗しました"
+  log INFO "CloudWatch メトリクスを取得しています(直近のメッセージ数)..."
+  aws_to_file "CloudWatch メトリクス(直近のメッセージ数)の取得" "${WORK_DIR}/metrics_latest.json" \
+    cloudwatch get-metric-data \
+    --metric-data-queries "file://${WORK_DIR}/queries_latest.json" \
+    --start-time "$(iso_utc $((NOW_EPOCH - LATEST_LOOKBACK_SEC)))" \
+    --end-time "$(iso_utc "${NOW_EPOCH}")" \
+    --scan-by TimestampDescending --output json
 }
 
 build_report() {
@@ -430,9 +679,9 @@ build_report() {
     "--output=${OUTPUT}"
     "--main-name=${MAIN_NAME}"
     "--main-url=${MAIN_URL}"
-    "--main-attrs=${WORK_DIR}/main_attrs.json"
     "--metrics=${WORK_DIR}/metrics_detail.json"
     "--baseline=${WORK_DIR}/metrics_baseline.json"
+    "--latest=${WORK_DIR}/metrics_latest.json"
     "--start=${START_EPOCH}"
     "--end=${END_EPOCH}"
     "--now=${NOW_EPOCH}"
@@ -440,15 +689,17 @@ build_report() {
     "--tz=${TZ_NAME}"
     "--tz-offset=$(TZ="${TZ_NAME}" date -d "@${START_EPOCH}" +%z)"
     "--region=${REGION}"
+    "--account=${QUEUE_ACCOUNT:-${CALLER_ACCOUNT}}"
+    "--identity=${CALLER_ARN}"
     "--dlq-source=${DLQ_SOURCE}"
     "--host=$(uname -n)"
     "--version=${SCRIPT_VERSION}"
   )
+  if ((SWITCHED_BACK)); then
+    args+=("--switchback=${SWITCHBACK_SCRIPT}")
+  fi
   if [[ -n "${DLQ_NAME}" ]]; then
     args+=("--dlq-name=${DLQ_NAME}" "--dlq-url=${DLQ_URL}")
-    if [[ -f "${WORK_DIR}/dlq_attrs.json" ]]; then
-      args+=("--dlq-attrs=${WORK_DIR}/dlq_attrs.json")
-    fi
   fi
   for note in "${NOTES[@]}"; do
     args+=("--note=${note}")
@@ -474,10 +725,10 @@ write_python() {
   cat >"${PY_SCRIPT}" <<'PYEOF'
 # -*- coding: utf-8 -*-
 """sqs_metrics_report.sh の内部処理
-  queries  : GetMetricData のクエリ(JSON)を生成
-  attr     : get-queue-attributes の結果から属性値を出力
-  dlq-name : RedrivePolicy から DLQ 名を出力
-  report   : 取得したメトリクスを集計して Excel(.xlsx) レポートを作成
+  queries        : GetMetricData のクエリ(JSON)を生成
+  queue-names    : list-metrics の結果からキュー名を出力
+  dlq-candidates : 命名規則から DLQ の候補を出力
+  report         : 取得したメトリクスを集計して Excel(.xlsx) レポートを作成
 """
 import argparse
 import calendar
@@ -510,6 +761,10 @@ METRICS = [
 METRIC_NAME = {k: m for k, m, _s, _h in METRICS}
 # 総メッセージ数 = 可視 + 処理中 + 遅延
 STOCK_KEYS = ('visible', 'notvisible', 'delayed')
+# 直近のメッセージ数(レポート作成時点の滞留状況)
+LATEST_KEYS = STOCK_KEYS + ('age',)
+# DLQ の命名規則: <キュー名>-dlq / <キュー名>_DLQ / <キュー名>-deadletter / dlq-<キュー名> 等
+DLQ_WORD = r'(?:dlq|dead[-_]?letters?(?:[-_]?queue)?)'
 
 
 # =============================================================================
@@ -532,12 +787,19 @@ def metric_query(qid, queue, metric, stat, period):
 
 
 def cmd_queries(a):
+    if a.kind == 'probe':
+        # 権限確認用(1指標のみ)
+        json.dump([metric_query('probe', a.main, METRIC_NAME['sent'], 'Sum', a.period)], sys.stdout, indent=1)
+        return
     targets = [('m', a.main)] + ([('d', a.dlq)] if a.dlq else [])
     queries = []
     for prefix, queue in targets:
         if a.kind == 'detail':
             for key, metric, stat, _how in METRICS:
                 queries.append(metric_query(f'{prefix}_{key}', queue, metric, stat, a.period))
+        elif a.kind == 'latest':
+            for key in LATEST_KEYS:
+                queries.append(metric_query(f'l{prefix}_{key}', queue, METRIC_NAME[key], 'Maximum', a.period))
         else:
             # 期間開始前の総メッセージ数(1時間ごとの最小値)
             for key in STOCK_KEYS:
@@ -545,30 +807,42 @@ def cmd_queries(a):
     json.dump(queries, sys.stdout, indent=1)
 
 
-def load_attrs(path):
-    if not path or not os.path.exists(path):
-        return {}
-    with open(path, encoding='utf-8') as f:
-        try:
-            return json.load(f).get('Attributes') or {}
-        except ValueError:
-            return {}
+def cmd_queue_names(a):
+    with open(a.list, encoding='utf-8') as f:
+        metrics = json.load(f).get('Metrics') or []
+    names = {d.get('Value') for m in metrics for d in m.get('Dimensions') or [] if d.get('Name') == 'QueueName'}
+    for name in sorted(n for n in names if n):
+        print(name)
 
 
-def cmd_attr(a):
-    print(load_attrs(a.attrs).get(a.name, ''))
+def cmd_dlq_candidates(a):
+    """<キュー名>-dlq 等の命名規則に一致するキューを出力(FIFO キューの DLQ は FIFO キュー)"""
+    fifo = a.main.endswith('.fifo')
+    base = a.main[:-5] if fifo else a.main
+    bases = {re.escape(base)}
+    m = re.match(r'^(.+?)(?:[-_]?queue|[-_]q)$', base, re.I)
+    if m:
+        # xxx-queue の DLQ を xxx-dlq とする命名にも対応
+        bases.add(re.escape(m.group(1)))
+    b = '|'.join(sorted(bases))
+    pat = re.compile(rf'^(?:(?:{b})[-_]?{DLQ_WORD}|{DLQ_WORD}[-_]?(?:{b})){re.escape(".fifo") if fifo else ""}$',
+                     re.I)
+    with open(a.names, encoding='utf-8') as f:
+        for name in (line.strip() for line in f):
+            if name and name != a.main and pat.match(name):
+                print(name)
 
 
-def parse_redrive(attrs):
-    try:
-        return json.loads(attrs.get('RedrivePolicy') or '{}')
-    except ValueError:
-        return {}
-
-
-def cmd_dlq_name(a):
-    arn = parse_redrive(load_attrs(a.attrs)).get('deadLetterTargetArn', '')
-    print(arn.rsplit(':', 1)[-1] if arn else '')
+def queue_ids(name, region, account):
+    """キュー名・リージョン・アカウント ID からキュー URL と ARN を生成"""
+    if not (name and region and account):
+        return '', ''
+    partition, domain = 'aws', 'amazonaws.com'
+    if region.startswith('cn-'):
+        partition, domain = 'aws-cn', 'amazonaws.com.cn'
+    elif region.startswith('us-gov-'):
+        partition = 'aws-us-gov'
+    return f'https://sqs.{region}.{domain}/{account}/{name}', f'arn:{partition}:sqs:{region}:{account}:{name}'
 
 
 # =============================================================================
@@ -1180,6 +1454,16 @@ def peak_index(values):
     return best
 
 
+def latest_values(results, prefix):
+    """直近データの時刻と {キー: 値} を返す(データが無い場合は (None, {}))"""
+    series = {k: results.get(f'l{prefix}_{k}', {}) for k in LATEST_KEYS}
+    ts_all = [t for s in series.values() for t in s]
+    if not ts_all:
+        return None, {}
+    ts = max(ts_all)
+    return ts, {k: s.get(ts) for k, s in series.items()}
+
+
 # =============================================================================
 # レポート作成
 # =============================================================================
@@ -1295,7 +1579,10 @@ def build_summary(wb, st, c):
     ws.heights[r] = 24
     r += 1
     if not has_dlq:
-        dlq_line, style = 'DLQ: 未設定のため集計していません', st['judge_na']
+        dlq_line = {'none': 'DLQ: 集計対象外（-d none）',
+                    'notfound': 'DLQ: 特定できなかったため集計していません（DLQ がある場合は -d で指定してください）'
+                    }.get(c.dlq_source, 'DLQ: 集計していません')
+        style = st['judge_na']
     elif c.dlq_total > 0:
         dp = c.dlq_peak
         dlq_line = (f'DLQ への追加あり: 合計 {c.dlq_total:,.0f} 件（推定）／ 発生時間帯 {c.dlq_hours_with_inflow} 件'
@@ -1311,13 +1598,20 @@ def build_summary(wb, st, c):
 
     # ---- 実行条件
     r = section(ws, st, r, '■ 実行条件')
-    dlq_src = {'auto': 'メインキューの RedrivePolicy から自動検出', 'arg': '引数(-d)で指定',
-               'none': '集計対象外(-d none)', 'notfound': 'RedrivePolicy 未設定のため集計なし'}.get(c.dlq_source, '-')
+    dlq_src = {'auto': '命名規則から自動検出（CloudWatch のメトリクス一覧より。RedrivePolicy とは未照合）',
+               'arg': '引数(-d)で指定', 'none': '集計対象外(-d none)',
+               'notfound': '特定できなかったため集計なし'}.get(c.dlq_source, '-')
     conds = [
         ('対象キュー', c.main_name),
         ('DLQ', f'{c.dlq_name}（{dlq_src}）' if c.dlq_name else dlq_src),
         ('リージョン', c.region or '-'),
         ('AWS アカウント ID', c.account or '-'),
+        ('認証情報', c.identity or '-'),
+    ]
+    if c.switchback:
+        conds.append(('スイッチバック', f'権限不足のため自動実行（source {c.switchback}）'))
+    conds += [
+        ('データ取得元', 'CloudWatch メトリクス（名前空間 AWS/SQS）※ SQS の API は使用していません'),
         ('集計期間', c.period_label),
         ('タイムゾーン', c.tz_label),
         ('集計単位', '1時間（各行は開始時刻から1時間）'),
@@ -1394,59 +1688,44 @@ def build_summary(wb, st, c):
     ws.set(r, 4, '同一期間内での比率（参考値）', st['wrap'])
     r += 2
 
-    # ---- キュー設定
-    r = section(ws, st, r, '■ キュー設定（レポート作成時点）')
+    # ---- キュー情報
+    r = section(ws, st, r, '■ キュー情報（CloudWatch のメトリクスから取得）')
     for j, (h, s) in enumerate([('項目', 'th'), ('メインキュー', 'th_main'), ('DLQ', 'th_dlq'), ('備考', 'th')], 1):
         ws.set(r, j, h, st[s])
     r += 1
-    ma, da = c.main_attrs, c.dlq_attrs
 
-    def attr_rows(at, name, url):
-        rp = parse_redrive(at)
-        created = at.get('CreatedTimestamp')
-        sse = '-'
-        if at.get('KmsMasterKeyId'):
-            sse = f'SSE-KMS ({at["KmsMasterKeyId"]})'
-        elif at.get('SqsManagedSseEnabled') == 'true':
-            sse = 'SSE-SQS'
-        elif at:
-            sse = '無効'
+    def info_rows(name, url, latest):
+        gen_url, arn = queue_ids(name, c.region, c.account)
+        ts, v = latest
 
         def num(k):
-            v = at.get(k)
-            return int(v) if v is not None and str(v).isdigit() else '-'
+            return int(v[k]) if v.get(k) is not None else '-'
         return [
-            name or '-', url or '-', at.get('QueueArn', '-'),
-            ('FIFO' if at.get('FifoQueue') == 'true' else '標準') if at else '-',
-            fmt_time(int(created), '%Y/%m/%d %H:%M:%S') if created and str(created).isdigit() else '-',
-            fmt_duration(at['VisibilityTimeout']) if 'VisibilityTimeout' in at else '-',
-            fmt_duration(at['MessageRetentionPeriod']) if 'MessageRetentionPeriod' in at else '-',
-            fmt_duration(at['DelaySeconds']) if 'DelaySeconds' in at else '-',
-            f'{int(at["MaximumMessageSize"]):,} byte' if str(at.get('MaximumMessageSize', '')).isdigit() else '-',
-            fmt_duration(at['ReceiveMessageWaitTimeSeconds']) if 'ReceiveMessageWaitTimeSeconds' in at else '-',
-            rp.get('deadLetterTargetArn', '-') if at else '-',
-            str(rp.get('maxReceiveCount', '-')) if at else '-',
-            sse,
-            num('ApproximateNumberOfMessages'),
-            num('ApproximateNumberOfMessagesNotVisible'),
-            num('ApproximateNumberOfMessagesDelayed'),
+            name or '-', url or gen_url or '-', arn or '-',
+            ('FIFO' if name.endswith('.fifo') else '標準') if name else '-',
+            fmt_time(ts, '%Y/%m/%d %H:%M') if ts is not None else '-',
+            num('visible'), num('notvisible'), num('delayed'),
+            fmt_duration(v['age']) if v.get('age') is not None else '-',
         ]
-    labels = ['キュー名', 'キュー URL', 'キュー ARN', 'キュー種別', '作成日時', '可視性タイムアウト',
-              'メッセージ保持期間', '配信遅延', '最大メッセージサイズ', '受信メッセージ待機時間',
-              'DLQ（deadLetterTargetArn）', '最大受信数（maxReceiveCount）', '暗号化',
-              '現在のメッセージ数（可視）', '現在のメッセージ数（処理中）', '現在のメッセージ数（遅延）']
-    notes = {'DLQ（deadLetterTargetArn）': 'メインキューの RedrivePolicy',
-             '最大受信数（maxReceiveCount）': 'この回数を超えて受信されたメッセージが DLQ へ移動',
-             '現在のメッセージ数（可視）': 'レポート作成時点の ApproximateNumberOfMessages'}
-    mrow = attr_rows(ma, c.main_name, c.main_url)
-    drow = attr_rows(da, c.dlq_name, c.dlq_url) if has_dlq else ['-'] * len(labels)
+    labels = ['キュー名', 'キュー URL', 'キュー ARN', 'キュー種別', '直近データの日時',
+              '直近のメッセージ数（可視）', '直近のメッセージ数（処理中）', '直近のメッセージ数（遅延）',
+              '直近の最古メッセージ経過時間']
+    notes = {'キュー URL': 'URL を指定しない場合はリージョン・アカウント ID から生成',
+             'キュー ARN': 'リージョン・アカウント ID から生成',
+             'キュー種別': 'キュー名の末尾(.fifo)から判定',
+             '直近データの日時': 'レポート作成時点から3時間以内の最新データ（1分粒度）。非アクティブなキューは「-」',
+             '直近のメッセージ数（可視）': 'ApproximateNumberOfMessagesVisible'}
+    mrow = info_rows(c.main_name, c.main_url, c.main_latest)
+    drow = info_rows(c.dlq_name, c.dlq_url, c.dlq_latest) if has_dlq else ['-'] * len(labels)
     for label, mv, dv in zip(labels, mrow, drow):
         ws.set(r, 1, label, st['key'])
         ws.set(r, 2, mv, st['int'] if isinstance(mv, int) else st['wrap'])
         ws.set(r, 3, dv, st['int'] if isinstance(dv, int) else st['wrap'])
         ws.set(r, 4, notes.get(label, ''), st['wrap'])
         r += 1
-    r += 1
+    ws.set(r, 1, '※ SQS の API を使用しないため、可視性タイムアウト・メッセージ保持期間・maxReceiveCount 等の'
+                 'キュー設定は表示していません。', st['note'])
+    r += 2
 
     # ---- 注意事項・警告
     r = section(ws, st, r, '■ 注意事項・警告')
@@ -1757,7 +2036,11 @@ def build_glossary(wb, st, c):
         'CloudWatch のデータ保持期間: 1分粒度 = 15日、5分粒度 = 63日、1時間粒度 = 455日。'
         '粒度は -g オプション(auto の場合は開始日時から自動選択)で指定します。',
         'Approximate 系のメトリクスは SQS の分散アーキテクチャによる概算値です。',
-        '本スクリプトの GetQueueAttributes 呼び出しにより、キューは CloudWatch 上でアクティブ扱いになります(過去のメトリクス値には影響しません)。',
+        '本スクリプトは SQS の API を使用せず、CloudWatch のメトリクスのみを参照します(キューの状態には影響しません)。'
+        'そのため、可視性タイムアウト・maxReceiveCount 等のキュー設定はレポートに含まれません。',
+        'DLQ を指定しない場合は、CloudWatch のメトリクス一覧(直近2週間にデータがあるキュー)から命名規則'
+        '(<キュー名>-dlq 等)に一致するキューを DLQ として自動検出します。RedrivePolicy とは照合していないため、'
+        '確実に集計する場合は -d で DLQ を指定してください。',
     ]
     for i, n in enumerate(notes, 1):
         ws.set(r, 1, f'注意 {i}', st['key'])
@@ -1771,6 +2054,7 @@ def cmd_report(a):
     start, end, period = a.start, a.end, a.period
     detail, notes1 = load_results(a.metrics)
     baseline, notes2 = load_results(a.baseline)
+    latest, notes3 = load_results(a.latest)
     n_hours = (end - start) // HOUR
     hours = [start + i * HOUR for i in range(n_hours)]
     off = local(start).strftime('%z')
@@ -1782,13 +2066,12 @@ def cmd_report(a):
     c.period_label = f'{fmt_time(start)} ～ {fmt_time(end)}（{n_hours}時間）'
     c.main_name, c.main_url = a.main_name, a.main_url
     c.dlq_name, c.dlq_url, c.dlq_source = a.dlq_name, a.dlq_url, a.dlq_source
-    c.main_attrs = load_attrs(a.main_attrs)
-    c.dlq_attrs = load_attrs(a.dlq_attrs)
-    arn = c.main_attrs.get('QueueArn', '').split(':')
-    c.account = arn[4] if len(arn) > 5 else ''
-    c.region = a.region or (arn[3] if len(arn) > 5 else '')
+    c.account, c.region = a.account, a.region
+    c.identity, c.switchback = a.identity, a.switchback
+    c.main_latest = latest_values(latest, 'm')
+    c.dlq_latest = latest_values(latest, 'd')
     c.host, c.version = a.host, a.version
-    c.notes = list(a.note) + notes1 + notes2
+    c.notes = list(a.note) + notes1 + notes2 + notes3
 
     # 詳細区間は期間開始時刻を起点に揃える(開始前の先読みデータも同じ刻みになる)
     c.main = regrid(detail, 'm', start, period)
@@ -1797,7 +2080,7 @@ def cmd_report(a):
     c.main_total = sum(m['sent'] for m in c.main_hourly)
     c.main_peak = peak_index([m['sent'] for m in c.main_hourly])
     if not any(c.main[k] for k in c.main):
-        c.notes.append('メインキューのメトリクスが取得できませんでした(キュー名・リージョン・期間・データ保持期間を確認してください)')
+        c.notes.append('メインキューのメトリクスが取得できませんでした(キュー名・リージョン・アカウント・期間・データ保持期間を確認してください)')
 
     c.dlq = c.dlq_hourly = c.dlq_hourly_m = c.dlq_flow = c.dlq_peak = None
     c.dlq_total, c.dlq_hours_with_inflow = 0.0, 0
@@ -1852,25 +2135,27 @@ def main():
     p = argparse.ArgumentParser()
     sub = p.add_subparsers(dest='cmd')
     q = sub.add_parser('queries')
-    q.add_argument('--kind', choices=['detail', 'baseline'], required=True)
+    q.add_argument('--kind', choices=['detail', 'baseline', 'latest', 'probe'], required=True)
     q.add_argument('--period', type=int, required=True)
     q.add_argument('--main', required=True)
     q.add_argument('--dlq')
-    q = sub.add_parser('attr')
-    q.add_argument('--attrs', required=True)
-    q.add_argument('--name', required=True)
-    q = sub.add_parser('dlq-name')
-    q.add_argument('--attrs', required=True)
+    q = sub.add_parser('queue-names')
+    q.add_argument('--list', required=True)
+    q = sub.add_parser('dlq-candidates')
+    q.add_argument('--names', required=True)
+    q.add_argument('--main', required=True)
     q = sub.add_parser('report')
-    for name in ('output', 'main-name', 'main-url', 'main-attrs', 'metrics', 'tz', 'version'):
+    for name in ('output', 'main-name', 'metrics', 'tz', 'version'):
         q.add_argument(f'--{name}', required=True)
     for name in ('start', 'end', 'now', 'period'):
         q.add_argument(f'--{name}', type=int, required=True)
-    for name in ('baseline', 'tz-offset', 'region', 'dlq-source', 'host', 'dlq-name', 'dlq-url', 'dlq-attrs'):
+    for name in ('baseline', 'latest', 'tz-offset', 'region', 'account', 'identity', 'switchback', 'dlq-source',
+                 'host', 'main-url', 'dlq-name', 'dlq-url'):
         q.add_argument(f'--{name}', default='')
     q.add_argument('--note', action='append', default=[])
     a = p.parse_args()
-    {'queries': cmd_queries, 'attr': cmd_attr, 'dlq-name': cmd_dlq_name, 'report': cmd_report}[a.cmd](a)
+    {'queries': cmd_queries, 'queue-names': cmd_queue_names, 'dlq-candidates': cmd_dlq_candidates,
+     'report': cmd_report}[a.cmd](a)
 
 
 if __name__ == '__main__':
@@ -1884,6 +2169,7 @@ PYEOF
 main() {
   parse_args "$@"
   check_prereqs
+  parse_queue_inputs
   resolve_times
   resolve_output
 
@@ -1893,6 +2179,8 @@ main() {
   trap 'exit 143' TERM
   write_python
 
+  ensure_aws_access
+  resolve_region
   resolve_queues
   fetch_metrics
   build_report
